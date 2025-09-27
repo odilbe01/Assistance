@@ -1,0 +1,20 @@
+services:
+  - type: worker
+    name: driver-watchdog-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: MAIN_GROUP_ID
+        sync: false
+      - key: TEAM_USERNAMES
+        sync: false
+      - key: TEAM_USER_IDS
+        sync: false
+      - key: OWNER_IDS
+        sync: false
+      - key: ALERT_DELAY_SECONDS
+        sync: false
