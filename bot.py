@@ -8,7 +8,7 @@ from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filte
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MAIN_GROUP_ID = int(os.getenv("MAIN_GROUP_ID", 0))
 TEAM_USERNAMES = [x.lower().replace("@", "") for x in os.getenv("TEAM_USERNAMES", "").split(",") if x]
-ALERT_DELAY_SECONDS = int(os.getenv("ALERT_DELAY_SECONDS", 180))
+ALERT_DELAY_SECONDS = int(os.getenv("ALERT_DELAY_SECONDS", 120))
 
 pending_messages = {}
 
