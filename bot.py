@@ -1,5 +1,3 @@
-
-
 import os
 import asyncio
 import logging
@@ -22,14 +20,16 @@ MAIN_GROUP_ID: Optional[int] = int(MAIN_GROUP_ID_ENV) if MAIN_GROUP_ID_ENV else 
 TEAM_USERNAMES_ENV = os.getenv("TEAM_USERNAMES", "").strip()
 TEAM_USER_IDS_ENV = os.getenv("TEAM_USER_IDS", "").strip()
 OWNER_IDS_ENV = os.getenv("OWNER_IDS", "").strip()
-ALERT_DELAY_SECONDS = int(os.getenv("ALERT_DELAY_SECONDS", "120") or 120)
+
+# ⬇️ DEFAULT ENDILIKDA 90 SEKUND
+ALERT_DELAY_SECONDS = int(os.getenv("ALERT_DELAY_SECONDS", "90") or 90)
 
 TEAM_USERNAMES: Set[str] = {u.strip().lower().lstrip("@") for u in TEAM_USERNAMES_ENV.split(",") if u.strip()}
 TEAM_USER_IDS: Set[int] = set(int(x.strip()) for x in TEAM_USER_IDS_ENV.split(",") if x.strip().isdigit())
 OWNER_IDS: Set[int] = set(int(x.strip()) for x in OWNER_IDS_ENV.split(",") if x.strip().isdigit())
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-log = logging.getLogger("watchdog-2min")
+log = logging.getLogger("watchdog-90s")
 
 PENDING: Dict[int, Tuple[asyncio.Task, Message]] = {}
 
@@ -63,7 +63,9 @@ async def cancel_pending(chat_id: int):
             pass
 
 async def schedule_alert(context: ContextTypes.DEFAULT_TYPE, chat_id: int, msg: Message):
+    # har safar yangidan taymer — oxirgi xabar bo‘yicha
     await cancel_pending(chat_id)
+
     async def _job():
         try:
             await asyncio.sleep(ALERT_DELAY_SECONDS)
@@ -74,7 +76,7 @@ async def schedule_alert(context: ContextTypes.DEFAULT_TYPE, chat_id: int, msg: 
             sender = msg.from_user.full_name if msg.from_user else "(unknown)"
             snippet = msg.text or msg.caption or "(non-text message)"
             header = (
-                f"🚨 *No team reply in {ALERT_DELAY_SECONDS // 60 or 1} min*\n"
+                f"🚨 *No team reply in {ALERT_DELAY_SECONDS} sec*\n"
                 f"👥 *Group:* {group_title}\n"
                 f"👤 *From:* {sender}\n\n"
                 f"{snippet[:4000]}"
@@ -85,15 +87,18 @@ async def schedule_alert(context: ContextTypes.DEFAULT_TYPE, chat_id: int, msg: 
                 parse_mode=ParseMode.MARKDOWN,
                 disable_web_page_preview=True,
             )
+            # asl xabarni ham forward qilishga urinamiz
             try:
                 await msg.forward(chat_id=MAIN_GROUP_ID)
             except Exception as e:
                 log.warning("Forward failed: %s", e)
         finally:
             PENDING.pop(chat_id, None)
+
     task = asyncio.create_task(_job())
     PENDING[chat_id] = (task, msg)
 
+# --- Commands ---
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Watchdog is running.\n"
@@ -165,6 +170,7 @@ async def list_team_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"TEAM ids: {', '.join(map(str, sorted(TEAM_USER_IDS))) or '(none)'}"
     )
 
+# --- Message handlers ---
 async def driver_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     msg = update.effective_message
@@ -174,9 +180,13 @@ async def driver_message_handler(update: Update, context: ContextTypes.DEFAULT_T
         return
     if not msg or not msg.from_user or msg.from_user.is_bot:
         return
+
+    # TEAM a’zosi yozsa → taymerni bekor qilamiz
     if is_team_user(update):
         await cancel_pending(chat.id)
         return
+
+    # Non-team xabar → 90s taymer
     await schedule_alert(context, chat.id, msg)
 
 async def my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -197,9 +207,10 @@ def main():
     app.add_handler(CommandHandler("listteam", list_team_cmd))
     app.add_handler(ChatMemberHandler(my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.StatusUpdate.ALL, driver_message_handler))
-    log.info("Watchdog 2-min started. MAIN=%s Delay=%ss", MAIN_GROUP_ID, ALERT_DELAY_SECONDS)
+    log.info("Watchdog 90s started. MAIN=%s Delay=%ss", MAIN_GROUP_ID, ALERT_DELAY_SECONDS)
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
+
 
