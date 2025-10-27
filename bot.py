@@ -41,10 +41,11 @@ DUP_SEEN: Dict[str, Tuple[float, int, str, str, str]] = {}
 # already alerted for (id, group_id) pairs to avoid spam
 DUP_ALERTED: Set[Tuple[str, int]] = set()
 
-# Trip ID va VRID/Load ID larni ajratish uchun regexlar
-_TRIP_RE = re.compile(r"\bT-[A-Z0-9]{6,20}\b", re.IGNORECASE)
-# Amazon VRID/Load/LRID ko‘rinishidagi 9–10 belgili (harf+raqam) tokenlar:
-_VRID_RE = re.compile(r"\b(?!T-)[A-Z0-9]{9,10}\b", re.IGNORECASE)
+# Trip / VRID regexlar (kengaytirilgan)
+# Trip ID: "T-XXXX", "T — XXXX", "T – XXXX", hatto "T    XXXX" bo‘lsa ham ushlaydi
+_TRIP_RE = re.compile(r"\bT[\-–—]?\s*[A-Z0-9]{6,20}\b", re.IGNORECASE)
+# VRID/Load ID: 9–10 belgili aralash (faqat harf yoki faqat raqam bo‘lsa — olmaymiz)
+_VRID_RE = re.compile(r"\b(?!T[\-–—]?\s*[A-Z0-9]{6,20})(?=[A-Z0-9]{9,10}\b)[A-Z0-9]{9,10}\b", re.IGNORECASE)
 
 # =================
 # Logging
@@ -147,7 +148,15 @@ def _extract_ids(text: str) -> Set[str]:
     if not text:
         return set()
     ids = set()
-    ids.update(m.upper() for m in _TRIP_RE.findall(text))
+    # Trip
+    for m in _TRIP_RE.findall(text):
+        # Normalize: T-XXXX formati
+        up = re.sub(r"\s+", "", m.upper())  # bo‘shliqni olib tashlaymiz (T   111QX...)
+        up = up.replace("–", "-").replace("—", "-")  # en/em dash -> hyphen
+        if up.startswith("T") and not up.startswith("T-"):
+            up = "T-" + up[1:]
+        ids.add(up)
+    # VRID/LOAD
     for tok in _VRID_RE.findall(text):
         up = tok.upper()
         if not up.isdigit() and not up.isalpha():
@@ -177,13 +186,13 @@ async def process_duplicate_check(context: ContextTypes.DEFAULT_TYPE, msg: Messa
     sender = (msg.from_user.full_name if msg.from_user else "(unknown)")
     snippet = text[:300]
 
-    log.debug("Duplicate-check: found IDs %s in group %s", found, group_title)
+    log.info("DUPCHK: found=%s group=%s (id=%s)", found, group_title, chat.id)
 
     for idv in found:
         first = DUP_SEEN.get(idv)
         if not first:
             DUP_SEEN[idv] = (_now(), chat.id, group_title, sender, snippet)
-            log.debug("First-seen ID=%s in group=%s", idv, group_title)
+            log.info("DUPCHK: first_seen ID=%s in group=%s", idv, group_title)
             continue
 
         _, first_gid, first_gtitle, first_sender, first_snip = first
@@ -218,10 +227,10 @@ async def process_duplicate_check(context: ContextTypes.DEFAULT_TYPE, msg: Messa
                 await msg.forward(chat_id=MAIN_GROUP_ID)
             except Exception:
                 pass
-            log.info("Duplicate WARNING sent for ID=%s (groups: %s -> %s)", idv, first_gtitle, group_title)
+            log.info("DUPCHK: WARNING sent for ID=%s (groups: %s -> %s)", idv, first_gtitle, group_title)
         except Exception:
             DUP_ALERTED.discard(key)
-            log.exception("Failed to send duplicate warning for ID=%s", idv)
+            log.exception("DUPCHK: failed to send warning for ID=%s", idv)
 
 # ================
 # Commands
@@ -356,11 +365,11 @@ def main():
     app.add_handler(CommandHandler("listteam", list_team_cmd))
     app.add_handler(CommandHandler("clearseen", clearseen_cmd))
     app.add_handler(ChatMemberHandler(my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
+
+    # Guruhlardagi *hamma* oddiy xabarlar o‘tsin (service updates chiqsin desangiz ~filters.StatusUpdate.ALL qoldiring)
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.StatusUpdate.ALL, driver_message_handler))
-    log.info(
-        "Watchdog 90s started. MAIN=%s Delay=%ss DUP_TTL=%ss",
-        MAIN_GROUP_ID, ALERT_DELAY_SECONDS, DUP_TTL_SECONDS
-    )
+
+    log.info("Watchdog 90s started. MAIN=%s Delay=%ss DUP_TTL=%ss", MAIN_GROUP_ID, ALERT_DELAY_SECONDS, DUP_TTL_SECONDS)
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
