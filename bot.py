@@ -33,7 +33,7 @@ TEAM_USERNAMES: Set[str] = {u.strip().lower().lstrip("@") for u in TEAM_USERNAME
 TEAM_USER_IDS: Set[int] = set(int(x.strip()) for x in TEAM_USER_IDS_ENV.split(",") if x.strip().isdigit())
 OWNER_IDS: Set[int] = set(int(x.strip()) for x in OWNER_IDS_ENV.split(",") if x.strip().isdigit())
 
-# --- NEW: duplicate detector settings ---
+# --- Duplicate detector settings ---
 DUP_TTL_SECONDS = int(os.getenv("DUP_TTL_SECONDS", str(24 * 60 * 60)) or 86400)  # 24h TTL
 
 # ID -> (first_seen_epoch, first_group_id, first_group_title, first_sender, first_snippet)
@@ -114,7 +114,6 @@ async def schedule_alert(context: ContextTypes.DEFAULT_TYPE, chat_id: int, msg: 
                 parse_mode=ParseMode.MARKDOWN,
                 disable_web_page_preview=True,
             )
-            # asl xabarni ham forward qilishga urinamiz
             try:
                 await msg.forward(chat_id=MAIN_GROUP_ID)
             except Exception as e:
@@ -125,7 +124,7 @@ async def schedule_alert(context: ContextTypes.DEFAULT_TYPE, chat_id: int, msg: 
     task = asyncio.create_task(_job())
     PENDING[chat_id] = (task, msg)
 
-# --- NEW: duplicate detector helpers ---
+# --- Duplicate detector helpers ---
 def _now() -> float:
     return time.time()
 
@@ -136,7 +135,6 @@ def _purge_expired_duplicates() -> None:
     to_del = [k for k, (ts, _, _, _, _) in DUP_SEEN.items() if ts < cutoff]
     for k in to_del:
         DUP_SEEN.pop(k, None)
-    # eski alert belgilarini ham yengillashtirib turamiz
     if DUP_ALERTED:
         to_keep = set()
         for (idv, gid) in DUP_ALERTED:
@@ -150,8 +148,6 @@ def _extract_ids(text: str) -> Set[str]:
         return set()
     ids = set()
     ids.update(m.upper() for m in _TRIP_RE.findall(text))
-    # VRID/LOAD ID lar – faqat harf+raqamli 9-10 belgili tokenlar,
-    # lekin to‘liq raqam bo‘lsa yoki faqat harf bo‘lsa olishmaymiz
     for tok in _VRID_RE.findall(text):
         up = tok.upper()
         if not up.isdigit() and not up.isalpha():
@@ -162,14 +158,11 @@ async def process_duplicate_check(context: ContextTypes.DEFAULT_TYPE, msg: Messa
     """
     Drayver guruhlarida bir xil Trip/VRID ikki marta ko‘rinsa MAIN groupga warning yuboradi.
     """
-    if not msg or not msg.chat or not msg.from_user:
-        return
-    if MAIN_GROUP_ID is None:
+    if not msg or not msg.chat or not MAIN_GROUP_ID:
         return
     chat = msg.chat
     if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return
-    # MAIN guruhning o‘zini tekshirmaymiz
     if chat.id == MAIN_GROUP_ID:
         return
 
@@ -181,26 +174,26 @@ async def process_duplicate_check(context: ContextTypes.DEFAULT_TYPE, msg: Messa
         return
 
     group_title = chat.title or "(no title)"
-    sender = msg.from_user.full_name
+    sender = (msg.from_user.full_name if msg.from_user else "(unknown)")
     snippet = text[:300]
+
+    log.debug("Duplicate-check: found IDs %s in group %s", found, group_title)
 
     for idv in found:
         first = DUP_SEEN.get(idv)
         if not first:
-            # birinchi marta ko‘rildi
             DUP_SEEN[idv] = (_now(), chat.id, group_title, sender, snippet)
+            log.debug("First-seen ID=%s in group=%s", idv, group_title)
             continue
 
-        first_ts, first_gid, first_gtitle, first_sender, first_snip = first
+        _, first_gid, first_gtitle, first_sender, first_snip = first
         if first_gid == chat.id:
-            # xuddi shu guruhda yana ko‘rildi — alert shart emas
+            # shu guruh ichida qayta — ignore
             continue
 
-        # boshqa guruhda paydo bo‘ldi – oldin alert yuborilmagan bo‘lsa yuboramiz
         key = (idv, chat.id)
         if key in DUP_ALERTED:
             continue
-
         DUP_ALERTED.add(key)
 
         header = (
@@ -221,14 +214,14 @@ async def process_duplicate_check(context: ContextTypes.DEFAULT_TYPE, msg: Messa
                 parse_mode=ParseMode.MARKDOWN,
                 disable_web_page_preview=True,
             )
-            # joriy xabarni forward qilamiz (oldingisini saqlamaymiz)
             try:
                 await msg.forward(chat_id=MAIN_GROUP_ID)
             except Exception:
                 pass
+            log.info("Duplicate WARNING sent for ID=%s (groups: %s -> %s)", idv, first_gtitle, group_title)
         except Exception:
-            # agar yuborishda muammo bo‘lsa — keyingi safar uchun alert flagini olib tashlaymiz
             DUP_ALERTED.discard(key)
+            log.exception("Failed to send duplicate warning for ID=%s", idv)
 
 # ================
 # Commands
@@ -304,7 +297,6 @@ async def list_team_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"TEAM ids: {', '.join(map(str, sorted(TEAM_USER_IDS))) or '(none)'}"
     )
 
-# NEW: Admin helper to clear duplicate cache manually
 async def clearseen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id):
         return
@@ -322,21 +314,25 @@ async def driver_message_handler(update: Update, context: ContextTypes.DEFAULT_T
         return
     if MAIN_GROUP_ID is not None and chat.id == MAIN_GROUP_ID:
         return
-    if not msg or not msg.from_user or msg.from_user.is_bot:
+    if not msg:
         return
 
-    # --- ALWAYS run duplicate check first (team bo‘lsa ham ishlasin) ---
+    # 1) DUPLICATE CHECK — har doim ishlaydi (bot xabarlari ham)
     try:
         await process_duplicate_check(context, msg)
     except Exception as e:
         log.warning("duplicate check failed: %s", e)
 
-    # Team a’zosi yozsa → faqat 90s taymerni bekor qilamiz
+    # 2) Agar xabarni bot yuborgan bo‘lsa, shu yerda to‘xtaymiz (watchdog yo‘q)
+    if msg.from_user and msg.from_user.is_bot:
+        return
+
+    # 3) TEAM a’zosi yozsa → 90s taymerni bekor qilamiz
     if is_team_user(update):
         await cancel_pending(chat.id)
         return
 
-    # Non-team xabar → 90s taymer
+    # 4) Oddiy foydalanuvchi xabari → 90s watchdog
     await schedule_alert(context, chat.id, msg)
 
 async def my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -358,12 +354,14 @@ def main():
     app.add_handler(CommandHandler("addteam", add_team_cmd))
     app.add_handler(CommandHandler("removeteam", remove_team_cmd))
     app.add_handler(CommandHandler("listteam", list_team_cmd))
-    app.add_handler(CommandHandler("clearseen", clearseen_cmd))  # NEW
+    app.add_handler(CommandHandler("clearseen", clearseen_cmd))
     app.add_handler(ChatMemberHandler(my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.StatusUpdate.ALL, driver_message_handler))
-    log.info("Watchdog 90s started. MAIN=%s Delay=%ss DUP_TTL=%ss", MAIN_GROUP_ID, ALERT_DELAY_SECONDS, DUP_TTL_SECONDS)
+    log.info(
+        "Watchdog 90s started. MAIN=%s Delay=%ss DUP_TTL=%ss",
+        MAIN_GROUP_ID, ALERT_DELAY_SECONDS, DUP_TTL_SECONDS
+    )
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
-
