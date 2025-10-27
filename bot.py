@@ -325,16 +325,16 @@ async def driver_message_handler(update: Update, context: ContextTypes.DEFAULT_T
     if not msg or not msg.from_user or msg.from_user.is_bot:
         return
 
-    # TEAM a’zosi yozsa → taymerni bekor qilamiz
-    if is_team_user(update):
-        await cancel_pending(chat.id)
-        return
-
-    # --- NEW: duplicate check (Trip/VRID multiple groups) ---
+    # --- ALWAYS run duplicate check first (team bo‘lsa ham ishlasin) ---
     try:
         await process_duplicate_check(context, msg)
     except Exception as e:
         log.warning("duplicate check failed: %s", e)
+
+    # Team a’zosi yozsa → faqat 90s taymerni bekor qilamiz
+    if is_team_user(update):
+        await cancel_pending(chat.id)
+        return
 
     # Non-team xabar → 90s taymer
     await schedule_alert(context, chat.id, msg)
@@ -366,5 +366,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
