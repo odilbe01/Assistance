@@ -26,19 +26,19 @@ TEAM_USERNAMES_ENV = os.getenv("TEAM_USERNAMES", "").strip()
 TEAM_USER_IDS_ENV = os.getenv("TEAM_USER_IDS", "").strip()
 OWNER_IDS_ENV = os.getenv("OWNER_IDS", "").strip()
 
-# ⬇️ DEFAULT ENDILIKDA 90 SEKUND
+# ⬇️ DEFAULT 90 SEKUND
 ALERT_DELAY_SECONDS = int(os.getenv("ALERT_DELAY_SECONDS", "90") or 90)
 
 TEAM_USERNAMES: Set[str] = {u.strip().lower().lstrip("@") for u in TEAM_USERNAMES_ENV.split(",") if u.strip()}
 TEAM_USER_IDS: Set[int] = set(int(x.strip()) for x in TEAM_USER_IDS_ENV.split(",") if x.strip().isdigit())
 OWNER_IDS: Set[int] = set(int(x.strip()) for x in OWNER_IDS_ENV.split(",") if x.strip().isdigit())
 
-# --- Duplicate detector settings ---
+# --- Duplicate detector settings (PIN ONLY) ---
 DUP_TTL_SECONDS = int(os.getenv("DUP_TTL_SECONDS", str(24 * 60 * 60)) or 86400)  # 24h TTL
 
-# LOAD_ID -> (first_seen_epoch, first_group_id)
+# Kalitlar PIN:LOAD_ID ko'rinishida bo'ladi -> (first_seen_epoch, first_group_id)
 DUP_SEEN: Dict[str, Tuple[float, int]] = {}
-# already alerted for (LOAD_ID, group_id) pairs to avoid spam
+# (key, group_id) juftligi bo'yicha oldin forward qilinganmi
 DUP_ALERTED: Set[Tuple[str, int]] = set()
 
 # =================
@@ -119,11 +119,12 @@ async def schedule_alert(context: ContextTypes.DEFAULT_TYPE, chat_id: int, msg: 
     task = asyncio.create_task(_job())
     PENDING[chat_id] = (task, msg)
 
-# ---------------- NEW: Only-📍pin-load extractor ----------------
-# pattern: "📍 1#: 111X58WPC"  (emoji optional spaces) <num> # optional spaces : optional -  <LOADID>
+# ---------------- PIN-only extractor ----------------
+# Qattiq format: satr boshida (yoki bo'shliqlardan so‘ng)
+#   📍 2#: 111X58WPC
+# emoji ixtiyoriy; ":" o‘rniga "：" yoki "-" ham bo‘lishi mumkin
 _PIN_LOAD_RE = re.compile(
-    r"(?:📍\s*)?(\d+)\s*#\s*[:：-]?\s*([A-Z0-9]{6,20})\b",
-    re.IGNORECASE,
+    r"(?mi)^\s*(?:📍\s*)?(\d+)\s*#\s*[:：-]?\s*([A-Z0-9]{6,20})\b"
 )
 
 def _purge_expired_duplicates() -> None:
@@ -134,24 +135,24 @@ def _purge_expired_duplicates() -> None:
     for k in to_del:
         DUP_SEEN.pop(k, None)
     if DUP_ALERTED:
-        to_keep = {(lid, gid) for (lid, gid) in DUP_ALERTED if lid in DUP_SEEN}
+        to_keep = {(key, gid) for (key, gid) in DUP_ALERTED if key in DUP_SEEN}
         DUP_ALERTED.clear()
         DUP_ALERTED.update(to_keep)
 
-def _extract_load_ids_from_pins(text: str) -> Set[str]:
-    """Only return LOAD IDs that appear after the numbered 📍 pin lines."""
-    if not text:
-        return set()
+def _extract_pin_load_ids(text: str) -> Set[str]:
+    """Faqat 📍 <n># : <LOAD_ID> formatidan ID qaytaradi. Kalit: PIN:<LOAD_ID>"""
     ids: Set[str] = set()
+    if not text:
+        return ids
     for _, load_id in _PIN_LOAD_RE.findall(text):
-        up = load_id.upper()
-        # must be alphanumeric (mix recommended), but allow all as given by format
-        ids.add(up)
+        lid = load_id.upper()
+        ids.add(f"PIN:{lid}")
     return ids
 
-async def process_duplicate_check(context: ContextTypes.DEFAULT_TYPE, msg: Message):
+async def process_pin_duplicate_forward(context: ContextTypes.DEFAULT_TYPE, msg: Message):
     """
     Bir xil 📍 <n># : <LOAD_ID> ikki xil driver guruhida ko‘rilsa → MAIN ga faqat forward.
+    Hech qanday "warning" matni yuborilmaydi.
     """
     if not msg or not msg.chat or not MAIN_GROUP_ID:
         return
@@ -164,35 +165,35 @@ async def process_duplicate_check(context: ContextTypes.DEFAULT_TYPE, msg: Messa
     _purge_expired_duplicates()
 
     text = msg.text or msg.caption or ""
-    found = _extract_load_ids_from_pins(text)
-    if not found:
+    keys = _extract_pin_load_ids(text)
+    if not keys:
         return
 
-    log.info("PIN-DUPCHK: found pin-load IDs=%s in group_id=%s", found, chat.id)
+    log.info("PINFWD: found keys=%s in group_id=%s", keys, chat.id)
 
-    for lid in found:
-        first = DUP_SEEN.get(lid)
+    for key in keys:
+        first = DUP_SEEN.get(key)
         if not first:
-            DUP_SEEN[lid] = (time.time(), chat.id)
+            DUP_SEEN[key] = (time.time(), chat.id)
             continue
 
         _, first_gid = first
         if first_gid == chat.id:
-            # shu guruhda ko‘rildi — e’tibor bermaymiz
+            # shu guruh ichida ko‘rildi — e’tibor bermaymiz
             continue
 
-        key = (lid, chat.id)
-        if key in DUP_ALERTED:
+        mark = (key, chat.id)
+        if mark in DUP_ALERTED:
             continue
-        DUP_ALERTED.add(key)
+        DUP_ALERTED.add(mark)
 
-        # Faqat forward qilish
+        # Faqat forward
         try:
             await msg.forward(chat_id=MAIN_GROUP_ID)
-            log.info("PIN-DUPCHK: forwarded duplicate LOAD_ID=%s from group_id=%s to MAIN", lid, chat.id)
+            log.info("PINFWD: forwarded duplicate %s from group_id=%s", key, chat.id)
         except Exception:
-            DUP_ALERTED.discard(key)
-            log.exception("PIN-DUPCHK: forward failed for LOAD_ID=%s", lid)
+            DUP_ALERTED.discard(mark)
+            log.exception("PINFWD: forward failed for %s", key)
 
 # ================
 # Commands
@@ -288,11 +289,11 @@ async def driver_message_handler(update: Update, context: ContextTypes.DEFAULT_T
     if not msg:
         return
 
-    # 1) PIN-LOAD DUPLICATE CHECK — har doim (bot xabarlari ham)
+    # 1) PIN-only duplicate forward — doimiy (bot xabarlari ham)
     try:
-        await process_duplicate_check(context, msg)
+        await process_pin_duplicate_forward(context, msg)
     except Exception as e:
-        log.warning("duplicate check failed: %s", e)
+        log.warning("pin duplicate check failed: %s", e)
 
     # 2) Agar xabarni bot yuborgan bo‘lsa, shu yerda to‘xtaymiz (watchdog yo‘q)
     if msg.from_user and msg.from_user.is_bot:
