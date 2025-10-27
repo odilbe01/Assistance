@@ -38,7 +38,7 @@ DUP_TTL_SECONDS = int(os.getenv("DUP_TTL_SECONDS", str(24 * 60 * 60)) or 86400) 
 
 # Kalitlar PIN:LOAD_ID ko'rinishida bo'ladi -> (first_seen_epoch, first_group_id)
 DUP_SEEN: Dict[str, Tuple[float, int]] = {}
-# (key, group_id) juftligi bo'yicha oldin forward qilinganmi
+# (key, group_id) juftligi bo'yicha oldin ogohlantirilganmi — spamdan saqlaydi
 DUP_ALERTED: Set[Tuple[str, int]] = set()
 
 # =================
@@ -48,12 +48,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 log = logging.getLogger("watchdog-90s")
 
 # ============
-# Globals
+// Globals
 # ============
 PENDING: Dict[int, Tuple[asyncio.Task, Message]] = {}
 
 # ============
-# Helpers
+// Helpers
 # ============
 def is_group(update: Update) -> bool:
     chat = update.effective_chat
@@ -72,7 +72,8 @@ def is_team_user(update: Update) -> bool:
     return uname in TEAM_USERNAMES
 
 def is_owner(user_id: Optional[int]) -> bool:
-    return bool(user_id and (not OWNER_IDS or user_id in OWNER_IDS))
+    # OWNER_IDS bo'sh bo'lsa — hamma admin demoqchi emasmiz, shuning uchun aynan ro'yxatdagina
+    return bool(user_id and (user_id in OWNER_IDS if OWNER_IDS else False))
 
 async def cancel_pending(chat_id: int):
     pair = PENDING.pop(chat_id, None)
@@ -151,8 +152,9 @@ def _extract_pin_load_ids(text: str) -> Set[str]:
 
 async def process_pin_duplicate_forward(context: ContextTypes.DEFAULT_TYPE, msg: Message):
     """
-    Bir xil 📍 <n># : <LOAD_ID> ikki xil driver guruhida ko‘rilsa → MAIN ga faqat forward.
-    Hech qanday "warning" matni yuborilmaydi.
+    Bir xil 📍 <n># : <LOAD_ID> 24 soat ichida ikki xil driver guruhida ko‘rilsa →
+    MAIN ga ⚠️ WARNING matni yuboradi va joriy xabarni forward qiladi.
+    (Har bir (ID, yangi_guruh) uchun faqat 1 marta.)
     """
     if not msg or not msg.chat or not MAIN_GROUP_ID:
         return
@@ -174,53 +176,84 @@ async def process_pin_duplicate_forward(context: ContextTypes.DEFAULT_TYPE, msg:
     for key in keys:
         first = DUP_SEEN.get(key)
         if not first:
+            # birinchi ko‘rish — saqlab qo‘yamiz
             DUP_SEEN[key] = (time.time(), chat.id)
             continue
 
         _, first_gid = first
         if first_gid == chat.id:
-            # shu guruh ichida ko‘rildi — e’tibor bermaymiz
+            # shu guruhda takrorlangani — boshqa guruh emas
             continue
 
         mark = (key, chat.id)
         if mark in DUP_ALERTED:
+            # shu (ID, guruh) bo‘yicha warning oldin yuborilgan
             continue
         DUP_ALERTED.add(mark)
 
-        # Faqat forward
+        # WARNING + forward
         try:
+            # key ko'rinishi: "PIN:111X58WPC" -> faqat ID ni ajratamiz
+            load_id = key.split(":", 1)[1] if ":" in key else key
+
+            # Guruh nomlarini olishga urinib ko‘ramiz (ruxsat bo‘lmasa ID chiqadi)
+            try:
+                first_chat = await context.bot.get_chat(first_gid)
+                first_title = first_chat.title or str(first_gid)
+            except Exception:
+                first_title = str(first_gid)
+
+            new_title = chat.title or str(chat.id)
+
+            header = (
+                "⚠️ *POSSIBLE DUPLICATE IN MULTIPLE DRIVER GROUPS*\n"
+                f"📦 *Load ID:* `{load_id}`\n\n"
+                f"1️⃣ *First group:* {first_title}\n"
+                f"2️⃣ *New group:* {new_title}\n"
+                "— Please investigate why the same Load ID appears in different driver groups."
+            )
+
+            await context.bot.send_message(
+                chat_id=MAIN_GROUP_ID,
+                text=header,
+                parse_mode=ParseMode.MARKDOWN,
+                disable_web_page_preview=True,
+            )
+
             await msg.forward(chat_id=MAIN_GROUP_ID)
-            log.info("PINFWD: forwarded duplicate %s from group_id=%s", key, chat.id)
+            log.info("PINFWD: alerted & forwarded duplicate %s from group_id=%s", key, chat.id)
+
         except Exception:
             DUP_ALERTED.discard(mark)
-            log.exception("PINFWD: forward failed for %s", key)
+            log.exception("PINFWD: alert/forward failed for %s", key)
 
 # ================
-# Commands
+// Commands
 # ================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Watchdog is running.\n"
-        "• Use /setmaingroup in your MAIN group.\n"
-        "• /addteam @u1 @u2 or numeric IDs.\n"
-        f"• Current delay: {ALERT_DELAY_SECONDS} seconds."
+        "• /setmaingroup ni MAIN guruh ichida bering.\n"
+        "• /addteam @u1 @u2 yoki IDlar.\n"
+        f"• Hozirgi delay: {ALERT_DELAY_SECONDS} sec."
     )
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id):
         return
     await update.message.reply_text(
-        "Main: {}\nTeam usernames: {}\nTeam IDs: {}\nDelay: {}s".format(
+        "Main: {}\nTeam usernames: {}\nTeam IDs: {}\nDelay: {}s\nOwners: {}".format(
             MAIN_GROUP_ID,
             ", ".join(sorted(TEAM_USERNAMES)) or "(none)",
             ", ".join(map(str, sorted(TEAM_USER_IDS))) or "(none)",
             ALERT_DELAY_SECONDS,
+            ", ".join(map(str, sorted(OWNER_IDS))) or "(none)",
         )
     )
 
 async def set_main_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_group(update):
-        await update.message.reply_text("Run this *inside* your MAIN group.", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("Bu buyruqni *MAIN* guruh ichida bering.", parse_mode=ParseMode.MARKDOWN)
         return
     if not is_owner(update.effective_user.id):
         await update.message.reply_text("Not authorized.")
@@ -277,7 +310,7 @@ async def clearseen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Duplicate cache cleared.")
 
 # ===================
-# Message handlers
+// Message handlers
 # ===================
 async def driver_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
@@ -289,17 +322,17 @@ async def driver_message_handler(update: Update, context: ContextTypes.DEFAULT_T
     if not msg:
         return
 
-    # 1) PIN-only duplicate forward — doimiy (bot xabarlari ham)
+    # 1) PIN-only duplicate — avval tekshiramiz (bot xabarlari ham kiritiladi)
     try:
         await process_pin_duplicate_forward(context, msg)
     except Exception as e:
         log.warning("pin duplicate check failed: %s", e)
 
-    # 2) Agar xabarni bot yuborgan bo‘lsa, shu yerda to‘xtaymiz (watchdog yo‘q)
+    # 2) Agar xabarni bot yuborgan bo‘lsa, watchdogni ishga tushirmaymiz
     if msg.from_user and msg.from_user.is_bot:
         return
 
-    # 3) TEAM a’zosi yozsa → 90s taymerni bekor qilamiz
+    # 3) TEAM a’zosi yozsa → 90s taymer bekor
     if is_team_user(update):
         await cancel_pending(chat.id)
         return
@@ -316,7 +349,7 @@ async def my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cancel_pending(chat.id)
 
 # ============
-# Entrypoint
+// Entrypoint
 # ============
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -334,3 +367,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
