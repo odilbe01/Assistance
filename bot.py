@@ -60,7 +60,7 @@ PENDING: Dict[int, Tuple[asyncio.Task, Message]] = {}
 # Duplicate detector (PIN-LOAD-ID asosida)
 # Kalit: "PIN:<LOAD_ID>" -> (first_seen_epoch, first_group_id, first_group_title)
 DUP_SEEN: Dict[str, Tuple[float, int, str]] = {}
-# Qaysi (kalit, group_id) bo‘yicha allaqachon alert/forward qilingan — shuni eslab qolamiz
+# Qaysi (kalit, group_id) bo‘yicha allaqachon alert qilingan — shuni eslab qolamiz
 DUP_ALERTED: Set[Tuple[str, int]] = set()
 
 # ---------------- PIN-only extractor ----------------
@@ -127,10 +127,6 @@ async def schedule_alert(context: ContextTypes.DEFAULT_TYPE, chat_id: int, msg: 
                 parse_mode=ParseMode.MARKDOWN,
                 disable_web_page_preview=True,
             )
-            try:
-                await msg.forward(chat_id=MAIN_GROUP_ID)
-            except Exception as e:
-                log.warning("Forward failed: %s", e)
         finally:
             PENDING.pop(chat_id, None)
 
@@ -162,8 +158,8 @@ def _extract_pin_load_ids(text: str) -> Set[str]:
 async def process_pin_duplicate_forward(context: ContextTypes.DEFAULT_TYPE, msg: Message):
     """
     Bir xil 📍 <n># : <LOAD_ID> ikki xil driver guruhida ko‘rilsa:
-      - agar WARN_ON_DUP=1 bo‘lsa → MAIN’ga warning matni yuboriladi
-      - har holda → asl xabar MAIN’ga forward qilinadi
+      - agar WARN_ON_DUP=1 bo‘lsa → MAIN’ga WARNING yuboriladi
+      - forward QILINMAYDI (faqat warning)
     (Har bir (key, group_id) uchun faqat bir marta).
     """
     if not msg or not msg.chat or not MAIN_GROUP_ID:
@@ -203,11 +199,10 @@ async def process_pin_duplicate_forward(context: ContextTypes.DEFAULT_TYPE, msg:
             continue
         DUP_ALERTED.add(mark)
 
-        # Warning (ixtiyoriy)
+        # Warning (faqat xabar, forward yo‘q)
         if WARN_ON_DUP:
             load_id = key.split(":", 1)[1]
 
-            # Guruh nomlari va yuboruvchini aniqlash
             group1 = first_title or "(no title)"
             group2 = chat.title or "(no title)"
             sender_name = "(unknown)"
@@ -228,27 +223,18 @@ async def process_pin_duplicate_forward(context: ContextTypes.DEFAULT_TYPE, msg:
                 await context.bot.send_message(
                     chat_id=MAIN_GROUP_ID,
                     text=(
-                        "⚠️ *WARNING: POSSIBLE DUPLICATE IN MULTIPLE DRIVER GROUPS*\n"
-                        f"📦 *Load ID:* `{load_id}`\n"
-                        f"👥 *Group 1:* {group1}\n"
-                        f"👥 *Group 2:* {group2}\n"
-                        f"👤 *Sender:* {sender_name}\n"
-                        "_Immediate action required: verify assignment to prevent double-booking, penalties, and pay conflicts._"
+                        "⚠️ WARNING: POSSIBLE DUPLICATE IN MULTIPLE DRIVER GROUPS\n"
+                        f"📦 Load ID: {load_id}\n"
+                        f"👥 Group 1: {group1}\n"
+                        f"👥 Group 2: {group2}\n"
+                        f"👤 Sender: {sender_name}\n"
+                        "Immediate action required: verify assignment to prevent double-booking, penalties, and pay conflicts."
                     ),
-                    parse_mode=ParseMode.MARKDOWN,
+                    parse_mode=ParseMode.MARKDOWN,  # markdownsız ham bo'ladi, lekin xavfsiz
                     disable_web_page_preview=True,
                 )
             except Exception:
                 log.exception("PINFWD: warning send failed for %s", key)
-
-        # Faqat forward (asl xabar)
-        try:
-            await msg.forward(chat_id=MAIN_GROUP_ID)
-            log.info("PINFWD: forwarded duplicate %s from group_id=%s", key, chat.id)
-        except Exception:
-            # forward yiqilsa, keyinchalik yana urinishi uchun mark ni olib tashlaymiz
-            DUP_ALERTED.discard(mark)
-            log.exception("PINFWD: forward failed for %s", key)
 
 # ================ Commands ================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -345,7 +331,7 @@ async def driver_message_handler(update: Update, context: ContextTypes.DEFAULT_T
     if not msg:
         return
 
-    # 1) PIN-only duplicate forward — (bot xabarlari ham)
+    # 1) PIN-only duplicate check (bot xabarlari ham)
     try:
         await process_pin_duplicate_forward(context, msg)
     except Exception as e:
