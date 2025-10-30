@@ -58,8 +58,8 @@ log = logging.getLogger("watchdog-90s")
 PENDING: Dict[int, Tuple[asyncio.Task, Message]] = {}
 
 # Duplicate detector (PIN-LOAD-ID asosida)
-# Kalit: "PIN:<LOAD_ID>" -> (first_seen_epoch, first_group_id)
-DUP_SEEN: Dict[str, Tuple[float, int]] = {}
+# Kalit: "PIN:<LOAD_ID>" -> (first_seen_epoch, first_group_id, first_group_title)
+DUP_SEEN: Dict[str, Tuple[float, int, str]] = {}
 # Qaysi (kalit, group_id) bo‘yicha allaqachon alert/forward qilingan — shuni eslab qolamiz
 DUP_ALERTED: Set[Tuple[str, int]] = set()
 
@@ -141,7 +141,7 @@ def _purge_expired_duplicates() -> None:
     if not DUP_SEEN:
         return
     cutoff = time.time() - DUP_TTL_SECONDS
-    to_del = [k for k, (ts, _) in DUP_SEEN.items() if ts < cutoff]
+    to_del = [k for k, (ts, _, _) in DUP_SEEN.items() if ts < cutoff]
     for k in to_del:
         DUP_SEEN.pop(k, None)
     if DUP_ALERTED:
@@ -186,10 +186,14 @@ async def process_pin_duplicate_forward(context: ContextTypes.DEFAULT_TYPE, msg:
     for key in keys:
         first = DUP_SEEN.get(key)
         if not first:
-            DUP_SEEN[key] = (time.time(), chat.id)
+            DUP_SEEN[key] = (
+                time.time(),
+                chat.id,
+                (chat.title or f"id:{chat.id}")
+            )
             continue
 
-        _, first_gid = first
+        _, first_gid, first_title = first
         if first_gid == chat.id:
             # shu guruh ichida ko‘rildi — e’tibor bermaymiz
             continue
@@ -202,12 +206,34 @@ async def process_pin_duplicate_forward(context: ContextTypes.DEFAULT_TYPE, msg:
         # Warning (ixtiyoriy)
         if WARN_ON_DUP:
             load_id = key.split(":", 1)[1]
+
+            # Guruh nomlari va yuboruvchini aniqlash
+            group1 = first_title or "(no title)"
+            group2 = chat.title or "(no title)"
+            sender_name = "(unknown)"
+            try:
+                if msg.forward_from:
+                    sender_name = msg.forward_from.full_name
+                elif msg.forward_from_chat:
+                    sender_name = (
+                        msg.forward_from_chat.title
+                        or ("@" + (msg.forward_from_chat.username or "unknown"))
+                    )
+                elif msg.from_user:
+                    sender_name = msg.from_user.full_name
+            except Exception:
+                pass
+
             try:
                 await context.bot.send_message(
                     chat_id=MAIN_GROUP_ID,
                     text=(
-                        "⚠️ *POSSIBLE DUPLICATE IN MULTIPLE DRIVER GROUPS*\n"
-                        f"📦 *Load ID:* `{load_id}`"
+                        "⚠️ *WARNING: POSSIBLE DUPLICATE IN MULTIPLE DRIVER GROUPS*\n"
+                        f"📦 *Load ID:* `{load_id}`\n"
+                        f"👥 *Group 1:* {group1}\n"
+                        f"👥 *Group 2:* {group2}\n"
+                        f"👤 *Sender:* {sender_name}\n"
+                        "_Immediate action required: verify assignment to prevent double-booking, penalties, and pay conflicts._"
                     ),
                     parse_mode=ParseMode.MARKDOWN,
                     disable_web_page_preview=True,
