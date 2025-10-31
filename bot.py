@@ -6,7 +6,7 @@ import json
 import asyncio
 import logging
 from typing import Dict, Optional, Set, Tuple, List
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 from telegram import Update, Message, ChatMember, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatType, ParseMode
@@ -33,9 +33,12 @@ ALERT_DELAY_SECONDS = int(os.getenv("ALERT_DELAY_SECONDS", "90") or 90)
 DUP_TTL_SECONDS = int(os.getenv("DUP_TTL_SECONDS", str(24 * 60 * 60)) or 86400)  # 24h TTL
 WARN_ON_DUP = os.getenv("WARN_ON_DUP", "1").strip() not in ("0", "false", "False")
 
-# Javob vaqti analitikasi uchun fayl
+# ===== Persistence files =====
 STATS_FILE = os.getenv("STATS_FILE", "reply_stats.json").strip()
-MAX_REPLY_WINDOW_SEC = int(os.getenv("MAX_REPLY_WINDOW_SEC", "300") or 300)  # 5 minut
+MAX_REPLY_WINDOW_SEC = int(os.getenv("MAX_REPLY_WINDOW_SEC", "300") or 300)  # 5 minutes
+GROUPS_FILE = os.getenv("GROUPS_FILE", "groups.json").strip()
+INACTIVE_FILE = os.getenv("INACTIVE_FILE", "inactive_groups.json").strip()
+ANALYZE_TEAM_FILE = os.getenv("ANALYZE_TEAM_FILE", "analyze_team.json").strip()
 
 TEAM_USERNAMES: Set[str] = {
     u.strip().lower().lstrip("@")
@@ -66,7 +69,7 @@ PENDING: Dict[int, Tuple[asyncio.Task, Message]] = {}
 # Duplicate detector (PIN-LOAD-ID asosida)
 # Kalit: "PIN:<LOAD_ID>" -> (first_seen_epoch, first_group_id, first_group_title)
 DUP_SEEN: Dict[str, Tuple[float, int, str]] = {}
-# Qaysi (kalit, group_id) bo‘yicha allaqachon alert/forward qilingan — shuni eslab qolamiz
+# Qaysi (kalit, group_id) bo‘yicha allaqachon alert qilingan — shuni eslab qolamiz
 DUP_ALERTED: Set[Tuple[str, int]] = set()
 
 # ---------------- PIN-only extractor ----------------
@@ -76,36 +79,49 @@ _PIN_LOAD_RE = re.compile(
 
 # --------- Reply-time analytics ---------
 # Har bir chat uchun oxirgi driver xabari va vaqti (sekund epoch)
-LAST_DRIVER_TS: Dict[int, float] = {}   # chat_id -> last driver epoch seconds
+LAST_DRIVER_TS: Dict[int, float] = {}
 
-# Stats yozuvlari: list of dicts
+# Stats: list of dicts
 # {"ts": 1730256000.0, "ym": "2025-10", "user_id": 123, "username": "alex", "name": "Alex", "seconds": 42.0}
 STATS: List[dict] = []
 
+# Group registry and activation flags
+KNOWN_GROUPS: Dict[int, str] = {}          # chat_id -> title
+INACTIVE_GROUPS: Set[int] = set()          # chat_id that are paused
+
+# Team-only analysis whitelist (lowercase usernames without @)
+ANALYZE_TEAM: Set[str] = set()
+
+# ============ Persistence helpers ============
+
+def _load_json(path: str, default):
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        log.warning("Could not load %s: %s", path, e)
+    return default
+
+
+def _save_json(path: str, data) -> None:
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception as e:
+        log.warning("Could not save %s: %s", path, e)
+
+
 def _load_stats() -> None:
     global STATS
-    try:
-        if os.path.exists(STATS_FILE):
-            with open(STATS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, list):
-                STATS = data
-            else:
-                STATS = []
-        else:
-            STATS = []
-    except Exception as e:
-        log.warning("Could not load stats: %s", e)
-        STATS = []
+    STATS = _load_json(STATS_FILE, []) or []
+
 
 def _save_stats() -> None:
-    try:
-        tmp = STATS_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(STATS, f, ensure_ascii=False)
-        os.replace(tmp, STATS_FILE)
-    except Exception as e:
-        log.warning("Could not save stats: %s", e)
+    _save_json(STATS_FILE, STATS)
+
 
 def _record_reply(user_id: int, username: str, name: str, seconds: float, ts: Optional[float] = None):
     if ts is None:
@@ -115,19 +131,36 @@ def _record_reply(user_id: int, username: str, name: str, seconds: float, ts: Op
         "ts": ts,
         "ym": ym,
         "user_id": int(user_id),
-        "username": username or "",
+        "username": (username or "").lower(),
         "name": name or "",
         "seconds": float(seconds)
     })
     _save_stats()
 
+
+def _load_groups() -> None:
+    global KNOWN_GROUPS, INACTIVE_GROUPS, ANALYZE_TEAM
+    KNOWN_GROUPS = _load_json(GROUPS_FILE, {}) or {}
+    INACTIVE_GROUPS = set(_load_json(INACTIVE_FILE, []) or [])
+    ANALYZE_TEAM = set((u or "").lower().lstrip("@") for u in (_load_json(ANALYZE_TEAM_FILE, []) or []))
+
+
+def _save_groups() -> None:
+    _save_json(GROUPS_FILE, KNOWN_GROUPS)
+    _save_json(INACTIVE_FILE, list(sorted(INACTIVE_GROUPS)))
+    _save_json(ANALYZE_TEAM_FILE, list(sorted(ANALYZE_TEAM)))
+
+
 # ============ Helpers ============
+
 def is_group(update: Update) -> bool:
     chat = update.effective_chat
     return chat and chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)
 
+
 def is_main(chat_id: int) -> bool:
     return MAIN_GROUP_ID is not None and chat_id == MAIN_GROUP_ID
+
 
 def is_team_user(update: Update) -> bool:
     u = update.effective_user
@@ -138,9 +171,11 @@ def is_team_user(update: Update) -> bool:
     uname = (u.username or "").lower()
     return uname in TEAM_USERNAMES
 
+
 def is_owner(user_id: Optional[int]) -> bool:
-    # OWNER_IDS bo'sh bo'lsa, hech kim owner emas (xavfsiz variant).
+    # OWNER_IDS bo'sh bo'lsa, hech kim owner emas.
     return bool(user_id and OWNER_IDS and user_id in OWNER_IDS)
+
 
 async def cancel_pending(chat_id: int):
     pair = PENDING.pop(chat_id, None)
@@ -152,7 +187,12 @@ async def cancel_pending(chat_id: int):
         except asyncio.CancelledError:
             pass
 
+
 async def schedule_alert(context: ContextTypes.DEFAULT_TYPE, chat_id: int, msg: Message):
+    # Agar guruh PAUSED bo'lsa — hech narsa qilmaymiz
+    if chat_id in INACTIVE_GROUPS:
+        return
+
     # har safar yangidan taymer — oxirgi xabar bo‘yicha
     await cancel_pending(chat_id)
 
@@ -183,6 +223,7 @@ async def schedule_alert(context: ContextTypes.DEFAULT_TYPE, chat_id: int, msg: 
     task = asyncio.create_task(_job())
     PENDING[chat_id] = (task, msg)
 
+
 def _purge_expired_duplicates() -> None:
     if not DUP_SEEN:
         return
@@ -195,6 +236,7 @@ def _purge_expired_duplicates() -> None:
         DUP_ALERTED.clear()
         DUP_ALERTED.update(to_keep)
 
+
 def _extract_pin_load_ids(text: str) -> Set[str]:
     """Faqat 📍 <n># : <LOAD_ID> formatidan ID qaytaradi. Kalit: PIN:<LOAD_ID>"""
     ids: Set[str] = set()
@@ -204,6 +246,7 @@ def _extract_pin_load_ids(text: str) -> Set[str]:
         lid = load_id.upper()
         ids.add(f"PIN:{lid}")
     return ids
+
 
 async def process_pin_duplicate_forward(context: ContextTypes.DEFAULT_TYPE, msg: Message):
     """
@@ -286,6 +329,7 @@ async def process_pin_duplicate_forward(context: ContextTypes.DEFAULT_TYPE, msg:
             except Exception:
                 log.exception("PINFWD: warning send failed for %s", key)
 
+
 # ================ Commands ================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -295,19 +339,22 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Current delay: {ALERT_DELAY_SECONDS} seconds."
     )
 
+
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id):
         return
     await update.message.reply_text(
-        "Main: {}\nTeam usernames: {}\nTeam IDs: {}\nDelay: {}s\nWarnOnDup: {}\nTTL: {}s".format(
+        "Main: {}\nTeam usernames: {}\nTeam IDs: {}\nDelay: {}s\nWarnOnDup: {}\nTTL: {}s\nPaused groups: {}".format(
             MAIN_GROUP_ID,
             ", ".join(sorted(TEAM_USERNAMES)) or "(none)",
             ", ".join(map(str, sorted(TEAM_USER_IDS))) or "(none)",
             ALERT_DELAY_SECONDS,
             WARN_ON_DUP,
             DUP_TTL_SECONDS,
+            ", ".join(str(g) for g in sorted(INACTIVE_GROUPS)) or "(none)",
         )
     )
+
 
 async def set_main_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_group(update):
@@ -319,6 +366,7 @@ async def set_main_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global MAIN_GROUP_ID
     MAIN_GROUP_ID = update.effective_chat.id
     await update.message.reply_text(f"MAIN group set to: {MAIN_GROUP_ID}")
+
 
 async def add_team_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id):
@@ -335,6 +383,7 @@ async def add_team_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             TEAM_USERNAMES.add(t.lower()); added.append("@"+t.lower())
     await update.message.reply_text("Added to TEAM: " + (", ".join(added) or "(none)"))
+
 
 async def remove_team_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id):
@@ -355,6 +404,7 @@ async def remove_team_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 TEAM_USERNAMES.remove(tl); removed.append("@"+tl)
     await update.message.reply_text("Removed from TEAM: " + (", ".join(removed) or "(none)"))
 
+
 async def list_team_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id):
         return
@@ -363,6 +413,7 @@ async def list_team_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"TEAM ids: {', '.join(map(str, sorted(TEAM_USER_IDS))) or '(none)'}"
     )
 
+
 async def clearseen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id):
         return
@@ -370,8 +421,62 @@ async def clearseen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     DUP_ALERTED.clear()
     await update.message.reply_text("Duplicate cache cleared.")
 
+
+# ---------- Running groups registry & toggles ----------
+async def _ensure_group_registered(chat) -> None:
+    if not chat or chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+    if chat.id not in KNOWN_GROUPS:
+        KNOWN_GROUPS[chat.id] = chat.title or f"id:{chat.id}"
+        _save_groups()
+
+
+async def running_groups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        return
+    # Human-friendly list
+    if not KNOWN_GROUPS:
+        await update.message.reply_text("No groups registered yet.")
+        return
+    lines = ["📋 *Running groups (known by bot):*", "(Active by default; 'Paused' means watchdog disabled)"]
+    for gid, title in sorted(KNOWN_GROUPS.items(), key=lambda x: x[1].lower()):
+        state = "Paused" if gid in INACTIVE_GROUPS else "Active"
+        mark = "⏸️" if state == "Paused" else "▶️"
+        lines.append(f"{mark} {title} — `{gid}` — {state}")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+
+async def _toggle_group_active(update: Update, context: ContextTypes.DEFAULT_TYPE, active: bool):
+    if not is_owner(update.effective_user.id):
+        return
+    chat = update.effective_chat
+    if not chat or chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await update.message.reply_text("Run this inside a *group*.", parse_mode=ParseMode.MARKDOWN)
+        return
+    await _ensure_group_registered(chat)
+    if active:
+        INACTIVE_GROUPS.discard(chat.id)
+        await update.message.reply_text("This group is now *Active*. Watchdog enabled.", parse_mode=ParseMode.MARKDOWN)
+    else:
+        INACTIVE_GROUPS.add(chat.id)
+        # cancel any pending timers for this chat
+        await cancel_pending(chat.id)
+        await update.message.reply_text("This group is now *Paused*. Watchdog disabled.", parse_mode=ParseMode.MARKDOWN)
+    _save_groups()
+
+
+# Accept both exact and numbered variants (e.g., /inactivategroup1)
+async def inactivate_group_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _toggle_group_active(update, context, active=False)
+
+
+async def activate_group_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _toggle_group_active(update, context, active=True)
+
+
 # ---------- ANALYSIS: UI & logic ----------
-def _month_buttons(n_months: int = 6) -> InlineKeyboardMarkup:
+
+def _month_buttons(n_months: int = 6, prefix: str = "ANALYZE") -> InlineKeyboardMarkup:
     today = datetime.now()
     months = []
     cur = datetime(today.year, today.month, 1)
@@ -381,12 +486,10 @@ def _month_buttons(n_months: int = 6) -> InlineKeyboardMarkup:
         # previous month
         prev_month = cur.replace(day=1) - timedelta(days=1)
         cur = datetime(prev_month.year, prev_month.month, 1)
-    # 2 qator: 3 tadan
     rows = [months[i:i+3] for i in range(0, len(months), 3)]
-    keyboard = [[InlineKeyboardButton(m, callback_data=f"ANALYZE:{m}")] for r in rows for m in r]
-    # yuqoridagi comprehension bir qatorda chiqaradi; pastdagisi 3 tadan qilib beradi:
-    keyboard = [ [InlineKeyboardButton(m, callback_data=f"ANALYZE:{m}") for m in row] for row in rows ]
+    keyboard = [[InlineKeyboardButton(m, callback_data=f"{prefix}:{m}") for m in row] for row in rows]
     return InlineKeyboardMarkup(keyboard)
+
 
 async def analiz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id):
@@ -394,10 +497,71 @@ async def analiz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_main(update.effective_chat.id):
         await update.message.reply_text("Please run in MAIN group.")
         return
+    # Two keyboards: All team vs MyTeam-only (if configured)
+    parts = ["Select a month for response-time analysis:"]
     await update.message.reply_text(
-        "Select a month for response-time analysis:",
-        reply_markup=_month_buttons(6)
+        "\n".join(parts + ["\n*All Team:*"]),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_month_buttons(6, prefix="ANALYZE")
     )
+    if ANALYZE_TEAM:
+        await update.message.reply_text(
+            "*MyTeam Only:*",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_month_buttons(6, prefix="ANALYZE_MY")
+        )
+    else:
+        await update.message.reply_text(
+            "No MyTeam set. Use `/myteamanalizsetup alex steve` to configure.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+
+async def _build_analysis_text(month: str, only_myteam: bool = False) -> str:
+    # Aggregate
+    per_user: Dict[int, Dict[str, float]] = {}
+
+    def _is_allowed_username(u: str) -> bool:
+        if not only_myteam:
+            return True
+        if not ANALYZE_TEAM:
+            return False
+        return (u or "").lower() in ANALYZE_TEAM
+
+    for rec in STATS:
+        if rec.get("ym") != month:
+            continue
+        uname = (rec.get("username") or "").lower()
+        if not _is_allowed_username(uname):
+            continue
+        uid = int(rec.get("user_id", 0))
+        per_user.setdefault(uid, {
+            "name": rec.get("name") or rec.get("username") or str(uid),
+            "sum": 0.0,
+            "count": 0.0,
+        })
+        per_user[uid]["sum"] += float(rec.get("seconds", 0.0))
+        per_user[uid]["count"] += 1.0
+
+    if not per_user:
+        scope = "MyTeam" if only_myteam else "All Team"
+        return f"No data for {month} ({scope})."
+
+    # Sort by avg asc, then count desc
+    rows = []
+    for uid, d in per_user.items():
+        avg = (d["sum"] / d["count"]) if d["count"] else 0.0
+        rows.append((avg, d["count"], d["name"]))
+    rows.sort(key=lambda x: (x[0], -x[1]))
+
+    scope = "MyTeam" if only_myteam else "All Team"
+    lines = [f"📊 *Reply-time analysis for {month}* — _{scope}_ (lower is better)"]
+    rank = 1
+    for avg, cnt, name in rows:
+        lines.append(f"{rank}. {name} — avg {int(round(avg))}s (n={int(cnt)})")
+        rank += 1
+    return "\n".join(lines)
+
 
 async def analiz_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.callback_query:
@@ -406,37 +570,36 @@ async def analiz_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(cq.from_user.id):
         await cq.answer("Not authorized.", show_alert=True)
         return
-    if not cq.data or not cq.data.startswith("ANALYZE:"):
+    if not cq.data or not (cq.data.startswith("ANALYZE:") or cq.data.startswith("ANALYZE_MY:")):
         return
+
+    only_myteam = cq.data.startswith("ANALYZE_MY:")
     month = cq.data.split(":", 1)[1]  # "YYYY-MM"
-    # Aggregate
-    per_user = {}
-    for rec in STATS:
-        if rec.get("ym") == month:
-            uid = rec.get("user_id")
-            per_user.setdefault(uid, {"name": rec.get("name") or rec.get("username") or str(uid),
-                                      "sum": 0.0, "count": 0})
-            per_user[uid]["sum"] += float(rec.get("seconds", 0))
-            per_user[uid]["count"] += 1
 
-    if not per_user:
-        await cq.edit_message_text(f"No data for {month}.")
+    text = await _build_analysis_text(month, only_myteam=only_myteam)
+    await cq.edit_message_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
+# ---------- MyTeam-only analysis setup ----------
+async def myteam_setup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
         return
+    # Expect a list of usernames or @usernames
+    newset: Set[str] = set()
+    for tok in context.args:
+        t = tok.strip().lower().lstrip("@")
+        if t:
+            newset.add(t)
+    global ANALYZE_TEAM
+    ANALYZE_TEAM = newset
+    _save_groups()
+    if ANALYZE_TEAM:
+        await update.message.reply_text(
+            "MyTeam for analysis set to: " + ", ".join(sorted(ANALYZE_TEAM))
+        )
+    else:
+        await update.message.reply_text("MyTeam cleared. Using All Team by default.")
 
-    # Sort by average ascending
-    rows = []
-    for uid, d in per_user.items():
-        avg = (d["sum"] / d["count"]) if d["count"] else 0.0
-        rows.append((avg, d["count"], d["name"]))
-    rows.sort(key=lambda x: (x[0], -x[1]))  # avg asc, then count desc
-
-    lines = [f"📊 *Reply-time analysis for {month}* (lower is better)"]
-    rank = 1
-    for avg, cnt, name in rows:
-        lines.append(f"{rank}. {name} — avg {int(round(avg))}s (n={cnt})")
-        rank += 1
-
-    await cq.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 # =================== Message handlers ===================
 async def driver_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -444,8 +607,18 @@ async def driver_message_handler(update: Update, context: ContextTypes.DEFAULT_T
     msg = update.effective_message
     if not chat or chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return
+
+    # Register group title/id for /runninggroups
+    await _ensure_group_registered(chat)
+
+    # If MAIN group — skip watchdog and analytics
     if MAIN_GROUP_ID is not None and chat.id == MAIN_GROUP_ID:
         return
+
+    # If group is paused — do nothing (no analytics, no watchdog)
+    if chat.id in INACTIVE_GROUPS:
+        return
+
     if not msg:
         return
 
@@ -456,8 +629,6 @@ async def driver_message_handler(update: Update, context: ContextTypes.DEFAULT_T
         log.warning("pin duplicate check failed: %s", e)
 
     # 2) Analytics: driver xabari / team javobi matching
-    #   - Team emas bo'lsa: driver deb belgilaymiz
-    #   - Team bo'lsa: agar oxirgi driver xabari bor va diff <= 300s -> yozib qo'yamiz
     now = time.time()
     if msg.from_user and not msg.from_user.is_bot:
         if is_team_user(update):
@@ -466,11 +637,10 @@ async def driver_message_handler(update: Update, context: ContextTypes.DEFAULT_T
             if last_ts:
                 diff = now - last_ts
                 if 0 <= diff <= MAX_REPLY_WINDOW_SEC:
-                    # record
                     user = msg.from_user
                     _record_reply(
                         user_id=user.id,
-                        username=user.username or "",
+                        username=(user.username or "").lower(),
                         name=user.full_name or "",
                         seconds=diff,
                         ts=now,
@@ -493,17 +663,24 @@ async def driver_message_handler(update: Update, context: ContextTypes.DEFAULT_T
     # 5) Oddiy foydalanuvchi xabari → 90s watchdog
     await schedule_alert(context, chat.id, msg)
 
+
 async def my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if not chat:
         return
+    # auto-register when added to a group
+    await _ensure_group_registered(chat)
+
     status = update.my_chat_member.new_chat_member.status
     if status in (ChatMember.KICKED, ChatMember.LEFT):
         await cancel_pending(chat.id)
 
+
 # ============ Entrypoint ============
+
 def main():
     _load_stats()
+    _load_groups()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -515,9 +692,17 @@ def main():
     app.add_handler(CommandHandler("listteam", list_team_cmd))
     app.add_handler(CommandHandler("clearseen", clearseen_cmd))
 
+    # Running groups
+    app.add_handler(CommandHandler("runninggroups", running_groups_cmd))
+
+    # Accept both exact and numbered variants (e.g., /inactivategroup1)
+    app.add_handler(CommandHandler(["inactivategroup", "inactivategroup1", "inactivategroup2", "inactivategroup3"], inactivate_group_cmd))
+    app.add_handler(CommandHandler(["activategroup", "activategroup1", "activategroup2", "activategroup3"], activate_group_cmd))
+
     # Analysis
     app.add_handler(CommandHandler("analiz", analiz_cmd))
-    app.add_handler(CallbackQueryHandler(analiz_cb, pattern=r"^ANALYZE:"))
+    app.add_handler(CallbackQueryHandler(analiz_cb, pattern=r"^(ANALYZE|ANALYZE_MY):"))
+    app.add_handler(CommandHandler("myteamanalizsetup", myteam_setup_cmd))
 
     app.add_handler(ChatMemberHandler(my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.StatusUpdate.ALL, driver_message_handler))
@@ -527,6 +712,7 @@ def main():
         MAIN_GROUP_ID, ALERT_DELAY_SECONDS, DUP_TTL_SECONDS, WARN_ON_DUP
     )
     app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
